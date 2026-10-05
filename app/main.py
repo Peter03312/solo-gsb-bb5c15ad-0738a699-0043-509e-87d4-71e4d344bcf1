@@ -13,6 +13,9 @@ from .schemas import (
     BatchLogsRequest,
     CreateDrillRequest,
     DrillResponse,
+    LockActionResponse,
+    LockListResponse,
+    LockRequest,
     LogEntry,
     ResultResponse,
 )
@@ -27,7 +30,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="应急无线电演练通联日志互证服务",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "记录各台站通联日志，按相互指认、波段/模式一致、时差不超限的"
         "规则完成全场最优配对（最大配对数 → 最小总时差 → 字典序最小），"
@@ -143,6 +146,43 @@ def list_logs(drill_id: str) -> list[dict]:
 )
 def get_result(drill_id: str) -> dict:
     return database.get_result(drill_id)
+
+
+# --------------------------------------------------------------------------
+# 人工锁定（复核员互证）：锁定/解除/清单；封存后拒绝一切锁定操作
+# --------------------------------------------------------------------------
+@app.put(
+    "/drills/{drill_id}/locks",
+    response_model=LockActionResponse,
+    tags=["locks"],
+    summary="锁定一对互证候选（重复锁定同一对视为重传，不推进版本）",
+)
+def lock_pair(drill_id: str, payload: LockRequest) -> dict:
+    return database.lock_pair(
+        drill_id, payload.record_a, payload.record_b
+    )
+
+
+@app.post(
+    "/drills/{drill_id}/locks/unlock",
+    response_model=LockActionResponse,
+    tags=["locks"],
+    summary="解除已有锁定（锁定不存在返回 404 lock_not_found）",
+)
+def unlock_pair(drill_id: str, payload: LockRequest) -> dict:
+    return database.unlock_pair(
+        drill_id, payload.record_a, payload.record_b
+    )
+
+
+@app.get(
+    "/drills/{drill_id}/locks",
+    response_model=LockListResponse,
+    tags=["locks"],
+    summary="查询锁定清单及最新互证结果",
+)
+def list_locks(drill_id: str) -> dict:
+    return database.list_locks(drill_id)
 
 
 @app.get("/health", tags=["system"], summary="健康检查")

@@ -12,6 +12,12 @@
   3. 仍并列时取字典序最小的配对列表：每对的两个记录号先内部升序，
      再把所有配对整体升序后按列表字典序比较。
 
+锁定（复核员人工互证）：
+  ``locked_keys`` 中的记录对强制入选结果，即使因此拉低全场配对数也不
+  替换；锁定对占用的记录从自由匹配池中剔除，剩余记录再按上述三级
+  目标求解。调用方须保证锁定对合法（现存、相互指认、波段/模式一致、
+  时差不超限），否则抛 :class:`InvalidLockError`。
+
 实现方式：
   相互指认关系天然构成二分图——按 ``(min(本台,对方), max(本台,对方),
   波段, 模式)`` 分边，本台呼号较小的记录在左部 L，另一条在右部 R，
@@ -67,20 +73,52 @@ class MatchResult:
     total_time_diff_seconds: float
 
 
+class InvalidLockError(ValueError):
+    """锁定对在当前日志集合上不再合法（缺失/不互证/波段模式/时差超限）。"""
+
+
 def _pair_key(r1: Record, r2: Record) -> tuple[str, str]:
     a, b = r1.record_no, r2.record_no
     return (a, b) if a <= b else (b, a)
 
 
-def match_records(
-    records: Sequence[Record], allowed_diff_seconds: float
-) -> MatchResult:
-    """计算全场最优互证配对。
+def pair_eligibility(
+    record_map: dict[str, Record], allowed_micros: int, a: str, b: str
+) -> tuple[str, str] | None:
+    """检查 ``(a, b)`` 是否为可锁定的互证候选。
 
-    ``records`` 内的记录号须唯一（服务层已保证）。
+    合法返回 ``None``；否则返回 ``(原因码, 中文说明)``，原因码取值：
+    ``same_record`` / ``record_missing`` / ``not_mutual`` /
+    ``band_mode`` / ``time_diff``。
     """
-    allowed_micros = int(round(allowed_diff_seconds * MICROS_PER_SECOND))
+    if a == b:
+        return "same_record", f"两条记录号不能相同: {a}"
+    ra = record_map.get(a)
+    rb = record_map.get(b)
+    if ra is None or rb is None:
+        missing = a if ra is None else b
+        return "record_missing", f"记录不存在: {missing}"
+    if ra.station != rb.counterpart or ra.counterpart != rb.station:
+        return "not_mutual", f"记录 {a} 与 {b} 未相互指认，不能锁定"
+    if ra.band != rb.band or ra.mode != rb.mode:
+        return "band_mode", f"记录 {a} 与 {b} 波段或模式不一致，不能锁定"
+    diff_micros = abs(ra.ts_micros - rb.ts_micros)
+    if diff_micros > allowed_micros:
+        return (
+            "time_diff",
+            f"记录 {a} 与 {b} 时差 {diff_micros / MICROS_PER_SECOND:g} 秒"
+            f"超过允许值 {allowed_micros / MICROS_PER_SECOND:g} 秒，不能锁定",
+        )
+    return None
 
+
+def _match_free(
+    records: Sequence[Record], allowed_micros: int
+) -> tuple[list[Pair], set[str], int]:
+    """在无锁定记录的集合上求全场最优匹配。
+
+    返回 ``(配对列表, 已配对记录号集合, 总时差微秒)``。
+    """
     # --- 构造候选边：用索引加速相互指认的查找 ---
     # 右部索引：(本台, 对方, band, mode) -> [记录...]，
     # 左部记录 r 以 (counterpart, station, band, mode) 反查即可找到
@@ -106,11 +144,7 @@ def match_records(
                 edges.append((i, j, diff_micros, _pair_key(r, records[j])))
 
     if not edges:
-        return MatchResult(
-            pairs=(),
-            unpaired=tuple(r.record_no for r in records),
-            total_time_diff_seconds=0.0,
-        )
+        return [], set(), 0
 
     # 边按配对键升序定等级：等级越小（记录号组合越小）字典序优先级越高。
     edges.sort(key=lambda e: e[3])
@@ -160,7 +194,6 @@ def match_records(
 
     # --- 最小费用最大流（Dijkstra + potential） ---
     potential = [0] * n_nodes
-    flow = 0
     while True:
         inf = None  # Python 大整数无溢出风险，用 None 表示不可达
         dist = [inf] * n_nodes
@@ -197,10 +230,10 @@ def match_records(
             rev = graph[v][arc[3]]
             rev[1] += 1
             v = u
-        flow += 1
 
     # --- 提取配对 ---
     pairs: list[Pair] = []
+    matched: set[str] = set()
     total_micros = 0
     for rank, (i, j, weight, key) in enumerate(edges):
         # L->R 的前向边容量被用尽 => 该边入选匹配。
@@ -214,12 +247,57 @@ def match_records(
                     time_diff_seconds=weight / MICROS_PER_SECOND,
                 )
             )
+            matched.add(records[i].record_no)
+            matched.add(records[j].record_no)
+    return pairs, matched, total_micros
+
+
+def match_records(
+    records: Sequence[Record],
+    allowed_diff_seconds: float,
+    locked_keys: Sequence[tuple[str, str]] = (),
+) -> MatchResult:
+    """计算全场最优互证配对。
+
+    ``records`` 内的记录号须唯一（服务层已保证）。``locked_keys`` 中的
+    记录对强制入选（服务层已校验合法且互不占用），其记录不参与自由
+    匹配；即使锁定使全场配对数下降，锁定对也保留不替换。
+    """
+    allowed_micros = int(round(allowed_diff_seconds * MICROS_PER_SECOND))
+    record_map = {r.record_no: r for r in records}
+
+    # --- 先固定全部锁定对，并把其记录移出自由匹配池 ---
+    pairs: list[Pair] = []
+    locked_ids: set[str] = set()
+    total_micros = 0
+    for raw_a, raw_b in locked_keys:
+        a, b = (raw_a, raw_b) if raw_a <= raw_b else (raw_b, raw_a)
+        problem = pair_eligibility(record_map, allowed_micros, a, b)
+        if problem is not None:
+            raise InvalidLockError(f"锁定 ({a}, {b}) 已失效: {problem[1]}")
+        if a in locked_ids or b in locked_ids:
+            raise InvalidLockError(f"记录被多个锁定对重复占用: {a}, {b}")
+        locked_ids.add(a)
+        locked_ids.add(b)
+        weight = abs(record_map[a].ts_micros - record_map[b].ts_micros)
+        total_micros += weight
+        pairs.append(
+            Pair(
+                record_a=a,
+                record_b=b,
+                time_diff_seconds=weight / MICROS_PER_SECOND,
+            )
+        )
+
+    free_records = [r for r in records if r.record_no not in locked_ids]
+    free_pairs, free_matched, free_total = _match_free(
+        free_records, allowed_micros
+    )
+    pairs.extend(free_pairs)
+    total_micros += free_total
 
     pairs.sort(key=lambda p: p.as_tuple())
-    matched: set[str] = set()
-    for p in pairs:
-        matched.add(p.record_a)
-        matched.add(p.record_b)
+    matched = locked_ids | free_matched
     unpaired = tuple(
         r.record_no for r in records if r.record_no not in matched
     )

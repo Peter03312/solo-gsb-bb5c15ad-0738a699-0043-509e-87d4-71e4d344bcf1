@@ -83,6 +83,46 @@ def main(base_url: str) -> None:
          "time": "2026-10-04T00:00:08+00:00", "band": "40m", "mode": "SSB"},
     ))
 
+    # --- 复核员人工锁定（互证） ---
+    # 锁定 R1-R2：现存、互指、同波段同模式、时差 5 秒 <= 10 秒
+    show("锁定 (R1, R2)", *call(
+        "PUT", f"{base_url}/drills/{drill}/locks",
+        {"record_a": "R1", "record_b": "R2"},
+    ))
+
+    # 重复锁定同一对（颠倒顺序）视为重传：版本不推进
+    show("重复锁定 (R2, R1)（重传，版本应不变）", *call(
+        "PUT", f"{base_url}/drills/{drill}/locks",
+        {"record_a": "R2", "record_b": "R1"},
+    ))
+
+    # 锁定非互证候选（R1 与 R3 不相互指认）-> 409 lock_not_candidate
+    show("锁定非候选 (R1, R3)（应被拒绝 409）", *call(
+        "PUT", f"{base_url}/drills/{drill}/locks",
+        {"record_a": "R1", "record_b": "R3"},
+    ))
+
+    # 更正 R2 使锁定时差超限（60 秒 > 10 秒）-> 409 lock_invalidated，
+    # 整次写入被拒绝，日志、锁定、版本均不变
+    show("更正 R2 致锁定失效（整次写入应被拒绝 409）", *call(
+        "PUT", f"{base_url}/drills/{drill}/logs/R2",
+        {"record_no": "R2", "station": "BH2BBB", "counterpart": "BH1AAA",
+         "time": "2026-10-04T00:01:00+00:00", "band": "40m", "mode": "SSB"},
+    ))
+
+    # 查询锁定清单及最新结果
+    show("查询锁定清单", *call("GET", f"{base_url}/drills/{drill}/locks"))
+
+    # 解除锁定（不存在的锁定会 404 lock_not_found）
+    show("解除不存在的锁定（应 404）", *call(
+        "POST", f"{base_url}/drills/{drill}/locks/unlock",
+        {"record_a": "R3", "record_b": "R6"},
+    ))
+    show("解除锁定 (R1, R2)（顺序任意，全场重算）", *call(
+        "POST", f"{base_url}/drills/{drill}/locks/unlock",
+        {"record_a": "R2", "record_b": "R1"},
+    ))
+
     show("查询最终互证结果", *call("GET", f"{base_url}/drills/{drill}/result"))
 
     show("封存演练", *call("POST", f"{base_url}/drills/{drill}/seal"))

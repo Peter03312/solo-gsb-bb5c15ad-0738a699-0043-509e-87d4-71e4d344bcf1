@@ -33,14 +33,38 @@
 同时满足上述三级目标。配套 150 组随机用例与穷举枚举结果逐一对照
 （`tests/test_matching.py`）。
 
+### 人工锁定（复核员互证）
+
+演练复核员可在**未封存**演练中，按两个记录号**锁定**一对互证候选；
+锁定对会**强制入选**互证结果：
+
+- 锁定仅接受同时满足下列条件的两条日志：**现存**、**相互指认**、
+  **波段相同**、**模式相同**、**时差不超过演练允许值**，且两条记录
+  **均未被其他锁定占用**；
+- 重算时**先保留全部锁定对**（其记录移出自由匹配池），再对剩余日志
+  沿用原“配对数最多 → 总时差最小 → 记录号字典序最小”规则；
+  **即使锁定使全场配对数下降，也绝不替换锁定对**；
+- **重复锁定同一对视为重传**（幂等，记录号顺序任意），不推进版本；
+- **解除不存在的锁定明确报错**（`404 lock_not_found`）；
+- 单条或批量**更正/写入使任一锁定失效**（记录被改到不互指、波段/模式
+  变化、时差超限等）时，**整次写入拒绝、状态不变**（`409
+  lock_invalidated`，事务回滚）；
+- **锁定状态变化与结果、版本原子提交**；无状态变化不推进版本；
+  **封存后拒绝一切锁定操作**（仍可查询锁定清单与最终结果）；
+- 无锁定时结果与历史行为**完全一致**，现有写入与结果查询的
+  请求/响应保持兼容。
+
 ### 版本语义
 
 - 每条日志以 `(演练号, 记录号)` 唯一标识；
 - **同内容重传不推进版本**（呼号大小写、首尾空白等规范化后相同即视为重传）；
 - **异内容视为更正**：更新日志后**重算全场**，`version + 1`，
   配对结果与新版本在同一事务原子落库；
+- **锁定/解除成功各 `version + 1`**，锁定状态、配对结果与版本同事务
+  原子提交；重复锁定同一对为重传，不推进版本；
 - 批量写入整体在一个事务内：任一条非法（含批次内记录号重复）则
-  **整批回滚**；
+  **整批回滚**；若写入/更正会使**任一既有锁定失效**，同样整批拒绝、
+  状态不变（`409 lock_invalidated`）；
 - 并发写入通过 SQLite `BEGIN IMMEDIATE` 串行化，版本号与配对结果
   **原子更新**，不会出现版本与结果错位；
 - **封存**演练后拒绝一切写入（返回 `409`），但仍可查询最终结果；
@@ -75,8 +99,8 @@ docker compose down -v       # 停止并删除数据卷
 ### 仅用 Docker
 
 ```bash
-docker build -t qso-log-attestation:1.0.0 .
-docker run -d --name qso -p 8080:8080 -v qso-data:/data qso-log-attestation:1.0.0
+docker build -t qso-log-attestation:1.1.0 .
+docker run -d --name qso -p 8080:8080 -v qso-data:/data qso-log-attestation:1.1.0
 ```
 
 ---
@@ -229,6 +253,78 @@ curl -X POST http://127.0.0.1:8080/drills/DRILL-2026/logs \
 - `unpaired`：未参与任何配对的记录号（按写入顺序）；
 - `version`：当前全场版本，同内容重传不变，异内容更正 +1。
 
+### 5.4 人工锁定（复核员互证）
+
+记录号通过请求体传递（避免 `/`、`.` 等记录号字符进入路径）；
+`record_a` / `record_b` 顺序任意，服务端按字典序内部升序存储。
+
+#### `PUT /drills/{drill_id}/locks` —— 锁定一对互证候选
+
+```bash
+curl -X PUT http://127.0.0.1:8080/drills/DRILL-2026/locks \
+  -H 'Content-Type: application/json' \
+  -d '{"record_a": "R1", "record_b": "R2"}'
+```
+
+响应 `200`（同时回传当前锁定对、锁定清单与最新互证结果）：
+
+```json
+{
+  "lock": {
+    "record_a": "R1",
+    "record_b": "R2",
+    "time_diff_seconds": 5.0,
+    "locked_at": "2026-10-04T12:00:05.000000+00:00"
+  },
+  "locks": [
+    {"record_a": "R1", "record_b": "R2",
+     "time_diff_seconds": 5.0,
+     "locked_at": "2026-10-04T12:00:05.000000+00:00"}
+  ],
+  "result": {
+    "drill_id": "DRILL-2026",
+    "version": 4,
+    "sealed": false,
+    "pairs": [{"record_a": "R1", "record_b": "R2", "time_diff_seconds": 5.0}],
+    "unpaired": ["R3"],
+    "total_time_diff_seconds": 5.0,
+    "recomputed_at": "2026-10-04T12:00:05.000000+00:00"
+  }
+}
+```
+
+锁定成功时**版本 +1**，锁定对强制出现在 `result.pairs` 中（即使全场
+配对数因此下降）。重复锁定同一对（含颠倒顺序）视为**重传**：返回
+`200`，`version` 不变。
+
+#### `POST /drills/{drill_id}/locks/unlock` —— 解除锁定
+
+```bash
+curl -X POST http://127.0.0.1:8080/drills/DRILL-2026/locks/unlock \
+  -H 'Content-Type: application/json' \
+  -d '{"record_a": "R2", "record_b": "R1"}'
+```
+
+解除成功响应结构同上（`lock` 为 `null`、`locks` 为解除后的清单），
+全场按无此锁定重算且**版本 +1**。锁定不存在返回
+`404 lock_not_found`。
+
+#### `GET /drills/{drill_id}/locks` —— 查询锁定清单及最新结果
+
+```json
+{
+  "drill_id": "DRILL-2026",
+  "locks": [
+    {"record_a": "R1", "record_b": "R2",
+     "time_diff_seconds": 5.0,
+     "locked_at": "2026-10-04T12:00:05.000000+00:00"}
+  ],
+  "result": { "...": "与 GET /result 完全一致的最新互证结果" }
+}
+```
+
+锁定操作的校验规则与错误见下节错误表。
+
 ---
 
 ## 6. 错误响应与状态码
@@ -242,10 +338,16 @@ curl -X POST http://127.0.0.1:8080/drills/DRILL-2026/logs \
 | 时间缺时区信息 | `422` | `时间必须携带时区信息，例如 2026-10-04T08:00:00+08:00` |
 | 本台呼号与对方呼号相同 | `422` | `本台呼号与对方呼号不能相同` |
 | 记录号/呼号/波段/模式为空 | `422` | 对应字段不能为空 |
-| 未知演练（查询/写入/封存） | `404` | `drill_not_found` |
+| 未知演练（查询/写入/封存/锁定） | `404` | `drill_not_found` |
 | 演练号已存在 | `409` | `drill_exists` |
-| 写入/封存已封存演练 | `409` | `drill_sealed`（封存后查询仍 `200`） |
+| 写入/封存/锁定已封存演练 | `409` | `drill_sealed`（封存后查询仍 `200`） |
 | 批次内记录号重复 | `409` | `duplicate_record_in_batch` |
+| 锁定的两个记录号相同 | `422` | `lock_same_record` |
+| 锁定引用了不存在的记录 | `404` | `lock_record_missing` |
+| 两条日志未相互指认 / 波段或模式不一致 / 时差超限 | `409` | `lock_not_candidate` |
+| 锁定涉及的记录已被其他锁定占用 | `409` | `record_already_locked` |
+| 解除不存在的锁定 | `404` | `lock_not_found` |
+| 写入/更正使任一既有锁定失效 | `409` | `lock_invalidated`（整次写入拒绝、状态不变） |
 
 ---
 
@@ -256,8 +358,8 @@ curl -X POST http://127.0.0.1:8080/drills/DRILL-2026/logs \
 ├── app/
 │   ├── main.py          # FastAPI 路由、异常处理、lifespan 初始化
 │   ├── schemas.py       # 请求/响应模型与输入校验（时区/负值/同呼号）
-│   ├── database.py      # SQLite 持久化、事务、版本与封存逻辑
-│   ├── matching.py      # 配对核心算法（二分图最小费用最大流）
+│   ├── database.py      # SQLite 持久化、事务、版本/封存/锁定逻辑
+│   ├── matching.py      # 配对核心算法（二分图最小费用最大流，支持强制锁定）
 │   └── config.py        # 环境变量配置
 ├── scripts/
 │   ├── init_db.py       # 数据初始化（建库/建表/WAL，幂等）

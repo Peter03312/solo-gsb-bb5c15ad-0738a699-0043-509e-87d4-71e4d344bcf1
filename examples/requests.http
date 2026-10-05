@@ -74,5 +74,37 @@ GET {{host}}/drills/{{drill}}/logs
 ### 查询互证结果（配对 + 未配对 + 版本 + 总时差）
 GET {{host}}/drills/{{drill}}/result
 
-### 封存演练（封存后写入返回 409，查询仍可用）
+### 锁定一对互证候选（记录号顺序任意，服务端内部升序）
+### 仅接受：现存、相互指认、波段/模式相同、时差不超允许值，
+### 且两条记录均未被其他锁定占用。锁定强制入选结果（即使拉低全场配对数）。
+PUT {{host}}/drills/{{drill}}/locks
+Content-Type: application/json
+
+{
+  "record_a": "R1",
+  "record_b": "R2"
+}
+
+### 重复锁定同一对（含颠倒顺序）视为重传：200，版本不推进
+PUT {{host}}/drills/{{drill}}/locks
+Content-Type: application/json
+
+{
+  "record_a": "R2",
+  "record_b": "R1"
+}
+
+### 查询锁定清单及最新互证结果
+GET {{host}}/drills/{{drill}}/locks
+
+### 解除已有锁定（不存在则 404 lock_not_found；顺序同样任意）
+POST {{host}}/drills/{{drill}}/locks/unlock
+Content-Type: application/json
+
+{
+  "record_a": "R1",
+  "record_b": "R2"
+}
+
+### 封存演练（封存后写入与锁定操作均返回 409，查询仍可用）
 POST {{host}}/drills/{{drill}}/seal

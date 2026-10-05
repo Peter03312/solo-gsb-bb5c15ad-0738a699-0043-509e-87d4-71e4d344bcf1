@@ -5,7 +5,15 @@ from __future__ import annotations
 import itertools
 import random
 
-from app.matching import MICROS_PER_SECOND, MatchResult, Record, match_records
+import pytest
+
+from app.matching import (
+    MICROS_PER_SECOND,
+    InvalidLockError,
+    MatchResult,
+    Record,
+    match_records,
+)
 
 
 def rec(no, station, counterpart, t, band="40m", mode="SSB"):
@@ -241,3 +249,98 @@ def test_pair_record_ids_sorted_within_and_between():
     ]
     r = match_records(records, 1)
     assert r.pairs[0].as_tuple() == ("10", "2")
+
+
+# --------------------------------------------------------------------------
+# 锁定（人工互证）
+# --------------------------------------------------------------------------
+def test_lock_forced_even_when_reduces_cardinality():
+    # 左: L1(t0) L2(t100)；右: R1(t0) R2(t50)；允许时差 50
+    # 自由最优: (L1,R1)+(L2,R2) 共 2 对；
+    # 锁定 (L1,R2) 后，L2-R1 时差 100 超限，只剩锁定 1 对——锁定不替换。
+    records = [
+        rec("L1", "A", "B", 0),
+        rec("L2", "A", "B", 100),
+        rec("R1", "B", "A", 0),
+        rec("R2", "B", "A", 50),
+    ]
+    r = match_records(records, 50, locked_keys=[("L1", "R2")])
+    assert [p.as_tuple() for p in r.pairs] == [("L1", "R2")]
+    assert set(r.unpaired) == {"L2", "R1"}
+    assert r.total_time_diff_seconds == 50
+
+
+def test_lock_pair_order_normalized():
+    records = [
+        rec("1", "A", "B", 0),
+        rec("2", "B", "A", 5),
+    ]
+    r = match_records(records, 10, locked_keys=[("2", "1")])
+    assert r.pairs[0].as_tuple() == ("1", "2")
+    assert r.pairs[0].time_diff_seconds == 5
+
+
+def test_lock_then_free_remainder_optimal():
+    # 锁定一对后，剩余记录仍按三级规则自由求解（含字典序决胜）。
+    records = [
+        rec("1", "A", "B", 0),
+        rec("2", "A", "B", 0),
+        rec("3", "B", "A", 0),
+        rec("4", "B", "A", 0),
+    ]
+    r = match_records(records, 10, locked_keys=[("1", "3")])
+    assert [p.as_tuple() for p in r.pairs] == [("1", "3"), ("2", "4")]
+    assert r.unpaired == ()
+
+
+def test_lock_total_diff_includes_locked():
+    records = [
+        rec("1", "A", "B", 0),
+        rec("2", "B", "A", 5),
+        rec("3", "C", "D", 0),
+        rec("4", "D", "C", 2),
+    ]
+    r = match_records(records, 10, locked_keys=[("1", "2")])
+    # 锁定时差 5 + 自由最优 (3,4) 时差 2
+    assert r.total_time_diff_seconds == 7
+
+
+def test_lock_invalid_missing_record_raises():
+    records = [rec("1", "A", "B", 0), rec("2", "B", "A", 0)]
+    with pytest.raises(InvalidLockError):
+        match_records(records, 10, locked_keys=[("1", "9")])
+
+
+def test_lock_invalid_not_mutual_raises():
+    records = [
+        rec("1", "A", "B", 0),
+        rec("2", "B", "A", 0),
+        rec("3", "X", "Y", 0),
+    ]
+    with pytest.raises(InvalidLockError):
+        match_records(records, 10, locked_keys=[("1", "3")])
+
+
+def test_lock_invalid_time_diff_raises():
+    records = [rec("1", "A", "B", 0), rec("2", "B", "A", 11)]
+    with pytest.raises(InvalidLockError):
+        match_records(records, 10, locked_keys=[("1", "2")])
+
+
+def test_lock_invalid_band_mode_raises():
+    records = [
+        rec("1", "A", "B", 0, band="40m", mode="SSB"),
+        rec("2", "B", "A", 0, band="20m", mode="SSB"),
+    ]
+    with pytest.raises(InvalidLockError):
+        match_records(records, 10, locked_keys=[("1", "2")])
+
+
+def test_lock_overlapping_records_raises():
+    records = [
+        rec("1", "A", "B", 0),
+        rec("2", "B", "A", 0),
+        rec("3", "B", "A", 0),
+    ]
+    with pytest.raises(InvalidLockError):
+        match_records(records, 10, locked_keys=[("1", "2"), ("1", "3")])

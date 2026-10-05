@@ -17,7 +17,14 @@ from datetime import datetime, timezone
 from typing import Iterable
 
 from . import config
-from .matching import MatchResult, Pair, Record, match_records
+from .matching import (
+    InvalidLockError,
+    MatchResult,
+    Pair,
+    Record,
+    match_records,
+    pair_eligibility,
+)
 
 MICROS_PER_SECOND = 1_000_000
 
@@ -52,6 +59,17 @@ CREATE TABLE IF NOT EXISTS results (
     unpaired_json             TEXT NOT NULL,
     total_time_diff_seconds   REAL NOT NULL,
     recomputed_at             TEXT NOT NULL,
+    FOREIGN KEY (drill_id) REFERENCES drills(drill_id)
+);
+
+-- 复核员人工锁定（互证）：记录号内部升序，一条记录至多被一个锁定占用。
+-- 占用冲突由服务层在写事务内校验（SQLite 不支持跨列互斥约束）。
+CREATE TABLE IF NOT EXISTS locks (
+    drill_id     TEXT NOT NULL,
+    record_a     TEXT NOT NULL,
+    record_b     TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    PRIMARY KEY (drill_id, record_a, record_b),
     FOREIGN KEY (drill_id) REFERENCES drills(drill_id)
 );
 """
@@ -89,6 +107,48 @@ class SealedError(ServiceError):
 class DuplicateRecordInBatchError(ServiceError):
     status_code = 409
     error_code = "duplicate_record_in_batch"
+
+
+class LockNotFoundError(ServiceError):
+    """解除的锁定不存在。"""
+
+    status_code = 404
+    error_code = "lock_not_found"
+
+
+class LockSameRecordError(ServiceError):
+    """锁定请求中两个记录号相同。"""
+
+    status_code = 422
+    error_code = "lock_same_record"
+
+
+class LockRecordMissingError(ServiceError):
+    """锁定引用了不存在的记录。"""
+
+    status_code = 404
+    error_code = "lock_record_missing"
+
+
+class LockNotCandidateError(ServiceError):
+    """两条现存日志不满足互证候选条件（互指/波段模式/时差）。"""
+
+    status_code = 409
+    error_code = "lock_not_candidate"
+
+
+class LockOccupiedError(ServiceError):
+    """锁定涉及的记录已被其他锁定占用。"""
+
+    status_code = 409
+    error_code = "record_already_locked"
+
+
+class LockInvalidatedError(ServiceError):
+    """写入/更正使既有锁定失效，整次写入被拒绝。"""
+
+    status_code = 409
+    error_code = "lock_invalidated"
 
 
 # --------------------------------------------------------------------------
@@ -166,6 +226,34 @@ def _load_records(conn: sqlite3.Connection, drill_id: str) -> list[Record]:
     return [_record_from_row(r) for r in rows]
 
 
+def _record_map(records: Iterable[Record]) -> dict[str, Record]:
+    return {r.record_no: r for r in records}
+
+
+def _load_lock_keys(conn: sqlite3.Connection, drill_id: str) -> list[tuple[str, str]]:
+    rows = conn.execute(
+        "SELECT record_a, record_b FROM locks WHERE drill_id = ? "
+        "ORDER BY record_a, record_b",
+        (drill_id,),
+    ).fetchall()
+    return [(r["record_a"], r["record_b"]) for r in rows]
+
+
+def _check_lock_candidate(
+    record_map: dict[str, Record], allowed_micros: int, a: str, b: str
+) -> None:
+    """把算法层原因码翻译为对应业务错误抛出；合法时静默返回。"""
+    problem = pair_eligibility(record_map, allowed_micros, a, b)
+    if problem is None:
+        return
+    code, message = problem
+    if code == "same_record":
+        raise LockSameRecordError(message)
+    if code == "record_missing":
+        raise LockRecordMissingError(message)
+    raise LockNotCandidateError(message)
+
+
 def _persist_result(
     conn: sqlite3.Connection, drill_id: str, version: int, result: MatchResult
 ) -> None:
@@ -201,11 +289,21 @@ def _persist_result(
 
 
 def _recompute(conn: sqlite3.Connection, drill_id: str) -> None:
-    """重算全场配对：版本 +1（调用方负责），结果与版本同事务落库。"""
+    """重算全场配对：版本 +1（调用方负责），结果与版本同事务落库。
+
+    先保留全部锁定对，再对剩余日志按“配对数最多、总时差最小、
+    记录号字典序最小”求解；锁定即使降低全场配对数也不替换。
+    """
     drill = _get_drill_row(conn, drill_id)
     version = drill["version"] + 1
     records = _load_records(conn, drill_id)
-    result = match_records(records, drill["allowed_diff_secs"])
+    lock_keys = _load_lock_keys(conn, drill_id)
+    try:
+        result = match_records(
+            records, drill["allowed_diff_secs"], locked_keys=lock_keys
+        )
+    except InvalidLockError as exc:
+        raise LockInvalidatedError(str(exc))
     conn.execute(
         "UPDATE drills SET version = ? WHERE drill_id = ?",
         (version, drill_id),
@@ -385,6 +483,173 @@ def seal_drill(drill_id: str) -> dict:
                 (_now_iso(), drill_id),
             )
         return get_drill(drill_id)
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------
+# 锁定（复核员人工互证）
+# --------------------------------------------------------------------------
+def _normalize_pair(a: str, b: str) -> tuple[str, str]:
+    return (a, b) if a <= b else (b, a)
+
+
+def _lock_items(
+    conn: sqlite3.Connection,
+    drill_id: str,
+    record_map: dict[str, Record] | None = None,
+) -> list[dict]:
+    """组装锁定清单（含实时计算的时差），按记录对升序。"""
+    rows = conn.execute(
+        "SELECT record_a, record_b, created_at FROM locks "
+        "WHERE drill_id = ? ORDER BY record_a, record_b",
+        (drill_id,),
+    ).fetchall()
+    if record_map is None:
+        record_map = _record_map(_load_records(conn, drill_id))
+    items = []
+    for row in rows:
+        a, b = row["record_a"], row["record_b"]
+        diff = None
+        if a in record_map and b in record_map:
+            diff = abs(
+                record_map[a].ts_micros - record_map[b].ts_micros
+            ) / MICROS_PER_SECOND
+        items.append(
+            {
+                "record_a": a,
+                "record_b": b,
+                "time_diff_seconds": diff,
+                "locked_at": row["created_at"],
+            }
+        )
+    return items
+
+
+def _result_from_conn(conn: sqlite3.Connection, drill_id: str) -> dict:
+    """在指定连接（可能是未提交的写事务内）读取当前互证结果。"""
+    drill = _get_drill_row(conn, drill_id)
+    row = conn.execute(
+        "SELECT * FROM results WHERE drill_id = ?", (drill_id,)
+    ).fetchone()
+    if row is None:  # 理论上不会发生（建演练即写空结果）
+        return {
+            "drill_id": drill_id,
+            "version": drill["version"],
+            "sealed": bool(drill["sealed"]),
+            "pairs": [],
+            "unpaired": [],
+            "total_time_diff_seconds": 0.0,
+        }
+    return {
+        "drill_id": drill_id,
+        "version": row["version"],
+        "sealed": bool(drill["sealed"]),
+        "pairs": json.loads(row["pairs_json"]),
+        "unpaired": json.loads(row["unpaired_json"]),
+        "total_time_diff_seconds": row["total_time_diff_seconds"],
+        "recomputed_at": row["recomputed_at"],
+    }
+
+
+def _lock_action_response(
+    conn: sqlite3.Connection,
+    drill_id: str,
+    record_map: dict[str, Record] | None = None,
+) -> dict:
+    locks = _lock_items(conn, drill_id, record_map)
+    payload = _result_from_conn(conn, drill_id)
+    return {
+        "lock": locks[-1] if locks else None,
+        "locks": locks,
+        "result": payload,
+    }
+
+
+def lock_pair(drill_id: str, record_a: str, record_b: str) -> dict:
+    """锁定一对互证候选；重复锁定同一对视为重传（幂等、不推进版本）。"""
+    a, b = _normalize_pair(record_a, record_b)
+    conn = connect()
+    try:
+        with _write_tx(conn):
+            drill = _get_drill_row(conn, drill_id)
+            _require_unsealed(drill)
+            if a == b:
+                raise LockSameRecordError(f"两条记录号不能相同: {a}")
+
+            existing = conn.execute(
+                "SELECT 1 FROM locks WHERE drill_id = ? AND record_a = ? "
+                "AND record_b = ?",
+                (drill_id, a, b),
+            ).fetchone()
+            if existing is not None:
+                # 重复锁定同一对：幂等重传，状态不变、版本不推进。
+                return _lock_action_response(conn, drill_id)
+
+            records = _load_records(conn, drill_id)
+            rmap = _record_map(records)
+            allowed_micros = int(
+                round(drill["allowed_diff_secs"] * MICROS_PER_SECOND)
+            )
+            _check_lock_candidate(rmap, allowed_micros, a, b)
+
+            # 两条记录均不得已被其他锁定占用。
+            occupied = conn.execute(
+                "SELECT record_a, record_b FROM locks WHERE drill_id = ? "
+                "AND (record_a = ? OR record_b = ? OR record_a = ? OR record_b = ?)",
+                (drill_id, a, a, b, b),
+            ).fetchall()
+            if occupied:
+                other = occupied[0]
+                raise LockOccupiedError(
+                    f"记录已被锁定 ({other['record_a']}, {other['record_b']}) "
+                    f"占用，不能重复锁定"
+                )
+
+            conn.execute(
+                "INSERT INTO locks (drill_id, record_a, record_b, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (drill_id, a, b, _now_iso()),
+            )
+            # 锁定状态变化与结果、版本原子提交。
+            _recompute(conn, drill_id)
+            return _lock_action_response(conn, drill_id, rmap)
+    finally:
+        conn.close()
+
+
+def unlock_pair(drill_id: str, record_a: str, record_b: str) -> dict:
+    """解除已有锁定；锁定不存在时明确报错（404 lock_not_found）。"""
+    a, b = _normalize_pair(record_a, record_b)
+    conn = connect()
+    try:
+        with _write_tx(conn):
+            drill = _get_drill_row(conn, drill_id)
+            _require_unsealed(drill)
+            cur = conn.execute(
+                "DELETE FROM locks WHERE drill_id = ? AND record_a = ? "
+                "AND record_b = ?",
+                (drill_id, a, b),
+            )
+            if cur.rowcount == 0:
+                raise LockNotFoundError(f"锁定不存在: ({a}, {b})")
+            # 解除锁定后重算：锁定状态变化与结果、版本原子提交。
+            _recompute(conn, drill_id)
+            return _lock_action_response(conn, drill_id)
+    finally:
+        conn.close()
+
+
+def list_locks(drill_id: str) -> dict:
+    """查询锁定清单及最新互证结果。"""
+    conn = connect()
+    try:
+        _get_drill_row(conn, drill_id)  # 未知演练 -> 404
+        return {
+            "drill_id": drill_id,
+            "locks": _lock_items(conn, drill_id),
+            "result": get_result(drill_id),
+        }
     finally:
         conn.close()
 

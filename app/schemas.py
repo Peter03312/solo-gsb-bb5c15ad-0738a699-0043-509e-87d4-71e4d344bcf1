@@ -150,6 +150,44 @@ class ResultResponse(StrictModel):
     recomputed_at: str | None = None
 
 
+class LockRequest(StrictModel):
+    """锁定/解除锁定请求体：一对记录号（顺序任意，服务端内部升序）。"""
+
+    record_a: str = Field(..., description="第一条记录号（演练内现存）")
+    record_b: str = Field(..., description="第二条记录号（演练内现存）")
+
+    @field_validator("record_a", "record_b")
+    @classmethod
+    def _record_no(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("记录号不能为空")
+        return v
+
+
+class LockItem(BaseModel):
+    record_a: str
+    record_b: str
+    time_diff_seconds: float | None = None
+    locked_at: str
+
+
+class LockActionResponse(StrictModel):
+    """锁定/解除操作响应：当前操作锁定、锁定清单与最新互证结果。"""
+
+    lock: LockItem | None = None
+    locks: list[LockItem]
+    result: ResultResponse
+
+
+class LockListResponse(StrictModel):
+    """锁定清单查询响应。"""
+
+    drill_id: str
+    locks: list[LockItem]
+    result: ResultResponse
+
+
 class DrillResponse(StrictModel):
     drill_id: str
     allowed_time_diff_seconds: float

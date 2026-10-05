@@ -1,7 +1,7 @@
 services:
   qso-service:
     build: .
-    image: qso-log-attestation:1.0.0
+    image: qso-log-attestation:1.1.0
     container_name: qso-log-attestation
     restart: unless-stopped
     ports:
