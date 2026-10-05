@@ -140,6 +140,22 @@ class PairOut(BaseModel):
     time_diff_seconds: float
 
 
+class LockOut(BaseModel):
+    """锁定清单中的一条锁定对（含锁定时刻与最新时差）。"""
+
+    record_a: str
+    record_b: str
+    time_diff_seconds: float | None = None
+    locked_at: str
+
+
+class LockListResponse(StrictModel):
+    drill_id: str
+    version: int
+    sealed: bool
+    locks: list[LockOut]
+
+
 class ResultResponse(StrictModel):
     drill_id: str
     version: int

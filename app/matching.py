@@ -24,6 +24,11 @@
       （奖励之差的绝对值 <= 2**E - 1），因此最小费用依次满足
       “时差和最小”、“配对列表字典序最小”。OFFSET = 2**(E-1)
       保证所有边费用非负，初始 potential 为 0 即可用 Dijkstra。
+
+复核员锁定对（``match_records`` 的 ``locked_pairs``）在求解前直接落
+入结果并把两条记录移出自由匹配；剩余日志仍由上述算法独立求解。锁定
+对的合法性（现存、互指、同波段/同模式、时差不超限、互不重叠）由服务
+层在锁定与每次写入前强制校验。
 """
 
 from __future__ import annotations
@@ -73,12 +78,73 @@ def _pair_key(r1: Record, r2: Record) -> tuple[str, str]:
 
 
 def match_records(
-    records: Sequence[Record], allowed_diff_seconds: float
+    records: Sequence[Record],
+    allowed_diff_seconds: float,
+    locked_pairs: Sequence[tuple[str, str]] = (),
 ) -> MatchResult:
-    """计算全场最优互证配对。
+    """计算全场最优互证配对（先保留锁定对，再对剩余日志求最优）。
+
+    ``locked_pairs`` 为复核员强制锁定的记录号对（每对顺序无关，内部
+    统一升序）：锁定对直接计入结果，其两条记录**不参与**剩余日志的
+    自由匹配；剩余日志仍按“配对数最多 → 总时差最小 → 记录号字典序
+    最小”求解。因此即使锁定会降低全场配对总数，也不会替换锁定对。
+
+    调用方须保证每个锁定对合法（两条记录均存在、相互指认、波段/模式
+    相同、时差不超限）且锁定对之间不共用记录（服务层在锁定/更正时
+    已强制校验）。
 
     ``records`` 内的记录号须唯一（服务层已保证）。
     """
+    locked_keys: set[tuple[str, str]] = set()
+    for a, b in locked_pairs:
+        key = (a, b) if a <= b else (b, a)
+        if key[0] != key[1]:
+            locked_keys.add(key)
+    locked_record_nos = {no for key in locked_keys for no in key}
+    free_records = [
+        r for r in records if r.record_no not in locked_record_nos
+    ]
+    free_result = _match_unconstrained(free_records, allowed_diff_seconds)
+    if not locked_keys:
+        # 无锁定：与历史行为完全一致（结果逐字节不变）。
+        return free_result
+
+    by_no = {r.record_no: r for r in records}
+    locked_pairs_out: list[Pair] = []
+    locked_total_micros = 0
+    for key in locked_keys:
+        ra = by_no[key[0]]
+        rb = by_no[key[1]]
+        weight = abs(rb.ts_micros - ra.ts_micros)
+        locked_total_micros += weight
+        locked_pairs_out.append(
+            Pair(key[0], key[1], weight / MICROS_PER_SECOND)
+        )
+
+    pairs = tuple(
+        sorted(
+            locked_pairs_out + list(free_result.pairs),
+            key=lambda p: p.as_tuple(),
+        )
+    )
+    # 用整数微秒汇总后再做一次除法，避免两次浮点除法相加产生 1ULP 误差。
+    free_total_micros = round(
+        free_result.total_time_diff_seconds * MICROS_PER_SECOND
+    )
+    return MatchResult(
+        pairs=pairs,
+        unpaired=free_result.unpaired,
+        total_time_diff_seconds=(
+            locked_total_micros + free_total_micros
+        ) / MICROS_PER_SECOND,
+    )
+
+
+def _match_unconstrained(
+    records: Sequence[Record],
+    allowed_diff_seconds: float,
+) -> MatchResult:
+    """对给定记录求解无锁定约束的全场最优（三级字典序取唯一解）。"""
     allowed_micros = int(round(allowed_diff_seconds * MICROS_PER_SECOND))
 
     # --- 构造候选边：用索引加速相互指认的查找 ---

@@ -74,5 +74,27 @@ GET {{host}}/drills/{{drill}}/logs
 ### 查询互证结果（配对 + 未配对 + 版本 + 总时差）
 GET {{host}}/drills/{{drill}}/result
 
-### 封存演练（封存后写入返回 409，查询仍可用）
+### 复核员锁定一对互证候选（两条记录须现存、互指、同波段/同模式、时差不超限）
+### 成功后直接返回最新互证结果；锁定对优先保留，剩余日志再按全场规则求解。
+### 记录对内部自动按字典序升序，锁定顺序无关。
+PUT {{host}}/drills/{{drill}}/locks/R1/R2
+
+### 重复锁定同一对（含反序）视为重传：幂等成功，不推进版本
+PUT {{host}}/drills/{{drill}}/locks/R2/R1
+
+### 查询锁定清单（含每条锁定的最新时差与锁定时间；封存后仍可查）
+GET {{host}}/drills/{{drill}}/locks
+
+### 解除已有锁定（不存在的锁定返回 404 lock_not_found；成功后重算全场）
+DELETE {{host}}/drills/{{drill}}/locks/R1/R2
+
+### 以下情形锁定会被拒绝：
+###   记录不存在 / 未相互指认 / 波段或模式不同 / 时差超限
+###   -> 422 invalid_lock_candidate
+###   候选记录已被其他锁定占用 -> 409 lock_record_busy
+###   演练已封存 -> 409 drill_sealed
+### 单条或批量更正若使任一现存锁定失效 -> 409 lock_invalidated_by_write，
+### 整次写入拒绝，日志/锁定/版本均不变（请先解除相关锁定再更正）。
+
+### 封存演练（封存后锁定/解除/写入均返回 409，查询仍可用）
 POST {{host}}/drills/{{drill}}/seal

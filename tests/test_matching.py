@@ -241,3 +241,83 @@ def test_pair_record_ids_sorted_within_and_between():
     ]
     r = match_records(records, 1)
     assert r.pairs[0].as_tuple() == ("10", "2")
+
+
+# --------------------------------------------------------------------------
+# 复核员锁定对：锁定对保留，剩余日志仍按三级目标求解
+# --------------------------------------------------------------------------
+def test_locked_pair_no_lock_equivalent_to_free_solution():
+    records = [
+        rec("1", "A", "B", 0),
+        rec("2", "B", "A", 5),
+    ]
+    locked = match_records(records, 10, ())
+    free = match_records(records, 10)
+    assert locked == free
+
+
+def test_locked_pair_forced_and_excluded_from_free_graph():
+    # 1 与 2/3 均可配；自由最优取字典序更小的 (1,2)。
+    records = [
+        rec("1", "A", "B", 0),
+        rec("2", "B", "A", 0),
+        rec("3", "B", "A", 0),
+    ]
+    r = match_records(records, 10, [("1", "3")])
+    assert r.pairs[0].as_tuple() == ("1", "3")
+    assert r.unpaired == ("2",)
+
+
+def test_locked_pair_order_normalized():
+    records = [
+        rec("1", "A", "B", 0),
+        rec("2", "B", "A", 5),
+    ]
+    r = match_records(records, 10, [("2", "1")])
+    assert r.pairs[0].as_tuple() == ("1", "2")
+    assert r.pairs[0].time_diff_seconds == 5
+
+
+def test_lock_not_replaced_when_cardinality_drops():
+    # 左: L1(t0) L2(t100)；右: R1(t0) R2(t50)；允许 50
+    # 边: L1-R1=0, L1-R2=50, L2-R2=50；自由最优两对。
+    records = [
+        rec("L1", "A", "B", 0),
+        rec("L2", "A", "B", 100),
+        rec("R1", "B", "A", 0),
+        rec("R2", "B", "A", 50),
+    ]
+    free = match_records(records, 50)
+    assert len(free.pairs) == 2
+    # 锁定 (L1,R2)=50：剩余 L2/R1 时差 100 超限无法配 => 仅 1 对
+    locked = match_records(records, 50, [("L1", "R2")])
+    assert [p.as_tuple() for p in locked.pairs] == [("L1", "R2")]
+    assert set(locked.unpaired) == {"L2", "R1"}
+    assert locked.total_time_diff_seconds == 50
+
+
+def test_locked_pair_plus_free_pairs_sorted():
+    # 锁定 (1,4) 时差 10；剩余 (2,3) 时差 0 自由配对。
+    records = [
+        rec("1", "A", "B", 0),
+        rec("2", "A", "B", 0),
+        rec("3", "B", "A", 0),
+        rec("4", "B", "A", 10),
+    ]
+    r = match_records(records, 10, [("1", "4")])
+    assert [p.as_tuple() for p in r.pairs] == [("1", "4"), ("2", "3")]
+    assert r.total_time_diff_seconds == 10
+    assert r.unpaired == ()
+
+
+def test_multiple_locked_pairs_all_preserved():
+    records = [
+        rec("1", "A", "B", 1),
+        rec("2", "B", "A", 2),
+        rec("3", "C", "D", 3),
+        rec("4", "D", "C", 4),
+    ]
+    r = match_records(records, 10, [("1", "2"), ("3", "4")])
+    assert [p.as_tuple() for p in r.pairs] == [("1", "2"), ("3", "4")]
+    assert r.total_time_diff_seconds == 2
+

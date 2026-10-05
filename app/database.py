@@ -54,6 +54,20 @@ CREATE TABLE IF NOT EXISTS results (
     recomputed_at             TEXT NOT NULL,
     FOREIGN KEY (drill_id) REFERENCES drills(drill_id)
 );
+
+-- 复核员手动锁定的互证候选对。record_a <= record_b（字典序），
+-- 与 results 的 pairs 内部排序规则一致；(drill_id, record_a,
+-- record_b) 唯一，且同一演练内任一记录号最多出现在一条锁定中
+-- （由服务层在同一写事务内校验）。
+CREATE TABLE IF NOT EXISTS locks (
+    drill_id     TEXT NOT NULL,
+    record_a     TEXT NOT NULL,
+    record_b     TEXT NOT NULL,
+    locked_at    TEXT NOT NULL,
+    PRIMARY KEY (drill_id, record_a, record_b),
+    FOREIGN KEY (drill_id) REFERENCES drills(drill_id)
+);
+CREATE INDEX IF NOT EXISTS idx_locks_drill ON locks (drill_id);
 """
 
 
@@ -89,6 +103,34 @@ class SealedError(ServiceError):
 class DuplicateRecordInBatchError(ServiceError):
     status_code = 409
     error_code = "duplicate_record_in_batch"
+
+
+class InvalidLockCandidateError(ServiceError):
+    """锁定候选不合法：记录不存在/不互指/波段模式不同/时差超限/同号。"""
+
+    status_code = 422
+    error_code = "invalid_lock_candidate"
+
+
+class LockRecordBusyError(ServiceError):
+    """候选记录之一已被其他锁定占用。"""
+
+    status_code = 409
+    error_code = "lock_record_busy"
+
+
+class LockNotFoundError(ServiceError):
+    """解除一条不存在的锁定。"""
+
+    status_code = 404
+    error_code = "lock_not_found"
+
+
+class LockInvalidatedByWriteError(ServiceError):
+    """单条/批量更正使现存锁定失效，整次写入拒绝。"""
+
+    status_code = 409
+    error_code = "lock_invalidated_by_write"
 
 
 # --------------------------------------------------------------------------
@@ -166,6 +208,100 @@ def _load_records(conn: sqlite3.Connection, drill_id: str) -> list[Record]:
     return [_record_from_row(r) for r in rows]
 
 
+def _load_lock_keys(
+    conn: sqlite3.Connection, drill_id: str
+) -> list[tuple[str, str]]:
+    rows = conn.execute(
+        "SELECT record_a, record_b FROM locks WHERE drill_id = ? "
+        "ORDER BY record_a, record_b",
+        (drill_id,),
+    ).fetchall()
+    return [(r["record_a"], r["record_b"]) for r in rows]
+
+
+def _check_lock_candidate(
+    by_no: dict[str, sqlite3.Row],
+    a_no: str,
+    b_no: str,
+    allowed_diff_secs: float,
+) -> None:
+    """校验一对候选是否满足“现存、互指、同波段同模式、时差不超限”。
+
+    入参为记录号 -> logs 行的映射；任一条件不满足即抛
+    InvalidLockCandidateError（中文消息指明原因）。
+    """
+    if a_no == b_no:
+        raise InvalidLockCandidateError(
+            f"不能锁定同一条记录: {a_no}"
+        )
+    ra = by_no.get(a_no)
+    rb = by_no.get(b_no)
+    missing = [no for no, row in ((a_no, ra), (b_no, rb)) if row is None]
+    if missing:
+        raise InvalidLockCandidateError(
+            "锁定失败，记录号不存在: " + ", ".join(sorted(missing))
+        )
+    if not (
+        ra["station"] == rb["counterpart"]
+        and ra["counterpart"] == rb["station"]
+    ):
+        raise InvalidLockCandidateError(
+            f"记录 {a_no} 与 {b_no} 未相互指认，不能锁定"
+        )
+    if ra["band"] != rb["band"]:
+        raise InvalidLockCandidateError(
+            f"记录 {a_no} 与 {b_no} 波段不同（{ra['band']} / "
+            f"{rb['band']}），不能锁定"
+        )
+    if ra["mode"] != rb["mode"]:
+        raise InvalidLockCandidateError(
+            f"记录 {a_no} 与 {b_no} 模式不同（{ra['mode']} / "
+            f"{rb['mode']}），不能锁定"
+        )
+    allowed_micros = int(round(allowed_diff_secs * MICROS_PER_SECOND))
+    if abs(ra["ts_micros"] - rb["ts_micros"]) > allowed_micros:
+        raise InvalidLockCandidateError(
+            f"记录 {a_no} 与 {b_no} 时差 "
+            f"{abs(ra['ts_micros'] - rb['ts_micros']) / MICROS_PER_SECOND:g}"
+            f" 秒超过允许值 {allowed_diff_secs:g} 秒，不能锁定"
+        )
+
+
+def _validate_existing_locks(
+    conn: sqlite3.Connection,
+    drill: sqlite3.Row,
+    records: list[Record] | None = None,
+) -> None:
+    """更正写入后调用：任一现存锁定失效即抛错（调用方整事务回滚）。
+
+    锁定行的存在性由外键+服务层保证，这里只需重新校验配对合法性；
+    锁定对之间不可能共用记录（入库时已强制）。
+    """
+    if records is None:
+        records = _load_records(conn, drill["drill_id"])
+    by_no = {r.record_no: r for r in records}
+    allowed = drill["allowed_diff_secs"]
+    allowed_micros = int(round(allowed * MICROS_PER_SECOND))
+    for a_no, b_no in _load_lock_keys(conn, drill["drill_id"]):
+        ra = by_no.get(a_no)
+        rb = by_no.get(b_no)
+        if (
+            ra is None
+            or rb is None
+            or not (
+                ra.station == rb.counterpart
+                and ra.counterpart == rb.station
+            )
+            or ra.band != rb.band
+            or ra.mode != rb.mode
+            or abs(ra.ts_micros - rb.ts_micros) > allowed_micros
+        ):
+            raise LockInvalidatedByWriteError(
+                f"本次写入会使锁定对 ({a_no}, {b_no}) 失效，"
+                "整次写入已拒绝，状态不变；请先解除相关锁定"
+            )
+
+
 def _persist_result(
     conn: sqlite3.Connection, drill_id: str, version: int, result: MatchResult
 ) -> None:
@@ -201,11 +337,19 @@ def _persist_result(
 
 
 def _recompute(conn: sqlite3.Connection, drill_id: str) -> None:
-    """重算全场配对：版本 +1（调用方负责），结果与版本同事务落库。"""
+    """重算全场配对：版本 +1（调用方负责），结果与版本同事务落库。
+
+    先保留全部锁定对（其记录不参与自由匹配），再对剩余日志沿用
+    “配对数最多、总时差最小、记录号字典序最小”规则求解；即使锁定
+    使全场配对数下降也不会替换锁定。
+    """
     drill = _get_drill_row(conn, drill_id)
     version = drill["version"] + 1
     records = _load_records(conn, drill_id)
-    result = match_records(records, drill["allowed_diff_secs"])
+    locked_pairs = _load_lock_keys(conn, drill_id)
+    result = match_records(
+        records, drill["allowed_diff_secs"], locked_pairs
+    )
     conn.execute(
         "UPDATE drills SET version = ? WHERE drill_id = ?",
         (version, drill_id),
@@ -301,6 +445,10 @@ def upsert_log(
                 changed = True
             # 同内容重传：什么都不改，版本不推进。
             if changed:
+                # 更正后若任一现存锁定失效：整次写入拒绝（事务回滚），
+                # 状态与版本保持不变。
+                latest = _load_records(conn, drill_id)
+                _validate_existing_locks(conn, drill, latest)
                 _recompute(conn, drill_id)
         return get_result(drill_id)
     finally:
@@ -368,6 +516,10 @@ def batch_upsert_logs(
                     )
                     changed = True
             if changed:
+                # 与单条写入一致：批量更正后任一现存锁定失效，则整批
+                # 拒绝回滚（连同本批所有写入），状态与版本保持不变。
+                latest = _load_records(conn, drill_id)
+                _validate_existing_locks(conn, drill, latest)
                 _recompute(conn, drill_id)
         return get_result(drill_id)
     finally:
@@ -385,6 +537,145 @@ def seal_drill(drill_id: str) -> dict:
                 (_now_iso(), drill_id),
             )
         return get_drill(drill_id)
+    finally:
+        conn.close()
+
+
+def _normalize_lock_record_nos(
+    record_a: str, record_b: str
+) -> tuple[str, str]:
+    a = (record_a or "").strip()
+    b = (record_b or "").strip()
+    if not a or not b:
+        raise InvalidLockCandidateError("两个记录号均不能为空")
+    # 与匹配结果一致：每对内部按记录号字典序升序存储。
+    return (a, b) if a <= b else (b, a)
+
+
+def lock_pair(drill_id: str, record_a: str, record_b: str) -> dict:
+    """锁定一对互证候选。
+
+    仅接受现存、相互指认、波段模式相同且时差不超限的两条日志，且
+    两条记录不得已被其他锁定占用。重复锁定同一对视为重传：幂等
+    成功、不推进版本。锁定后对剩余日志重算全场，锁定状态、结果与
+    版本在同一事务原子提交。
+    """
+    a, b = _normalize_lock_record_nos(record_a, record_b)
+    conn = connect()
+    try:
+        with _write_tx(conn):
+            drill = _get_drill_row(conn, drill_id)
+            _require_unsealed(drill)
+            existing = {
+                key
+                for key in _load_lock_keys(conn, drill_id)
+            }
+            if (a, b) in existing:
+                # 重复锁定同一对：视为重传，无变化不推进版本。
+                return get_result(drill_id)
+            log_rows = conn.execute(
+                "SELECT * FROM logs WHERE drill_id = ?", (drill_id,)
+            ).fetchall()
+            by_no = {r["record_no"]: r for r in log_rows}
+            _check_lock_candidate(
+                by_no, a, b, drill["allowed_diff_secs"]
+            )
+            # 两条记录均不得已被其他锁定占用。
+            busy = sorted(
+                {
+                    no
+                    for no in (a, b)
+                    for (x, y) in existing
+                    if no == x or no == y
+                }
+            )
+            if busy:
+                raise LockRecordBusyError(
+                    "记录已被其他锁定占用: " + ", ".join(busy)
+                )
+            conn.execute(
+                "INSERT INTO locks (drill_id, record_a, record_b, "
+                "locked_at) VALUES (?, ?, ?, ?)",
+                (drill_id, a, b, _now_iso()),
+            )
+            _recompute(conn, drill_id)
+        return get_result(drill_id)
+    finally:
+        conn.close()
+
+
+def unlock_pair(drill_id: str, record_a: str, record_b: str) -> dict:
+    """解除已有锁定；解除不存在的锁定明确报错（404）。
+
+    解除成功后对剩余日志重算全场；锁定状态、结果与版本原子提交。
+    """
+    a, b = _normalize_lock_record_nos(record_a, record_b)
+    conn = connect()
+    try:
+        with _write_tx(conn):
+            drill = _get_drill_row(conn, drill_id)
+            _require_unsealed(drill)
+            row = conn.execute(
+                "SELECT 1 FROM locks WHERE drill_id = ? AND record_a = ? "
+                "AND record_b = ?",
+                (drill_id, a, b),
+            ).fetchone()
+            if row is None:
+                raise LockNotFoundError(
+                    f"锁定不存在，无法解除: ({a}, {b})"
+                )
+            conn.execute(
+                "DELETE FROM locks WHERE drill_id = ? AND record_a = ? "
+                "AND record_b = ?",
+                (drill_id, a, b),
+            )
+            _recompute(conn, drill_id)
+        return get_result(drill_id)
+    finally:
+        conn.close()
+
+
+def list_locks(drill_id: str) -> dict:
+    """查询锁定清单及其最新时差（随日志更正保持一致，更正使锁定失效
+    的写入会被拒绝，因此锁定对始终合法）。"""
+    conn = connect()
+    try:
+        drill = _get_drill_row(conn, drill_id)
+        rows = conn.execute(
+            "SELECT * FROM locks WHERE drill_id = ? "
+            "ORDER BY record_a, record_b",
+            (drill_id,),
+        ).fetchall()
+        by_no = {
+            r["record_no"]: r
+            for r in conn.execute(
+                "SELECT * FROM logs WHERE drill_id = ?", (drill_id,)
+            ).fetchall()
+        }
+        items = []
+        for row in rows:
+            a_no, b_no = row["record_a"], row["record_b"]
+            ra, rb = by_no.get(a_no), by_no.get(b_no)
+            if ra is not None and rb is not None:
+                diff = abs(ra["ts_micros"] - rb["ts_micros"]) / (
+                    MICROS_PER_SECOND
+                )
+            else:
+                diff = None  # 理论不可达：失效写入会被拒绝
+            items.append(
+                {
+                    "record_a": a_no,
+                    "record_b": b_no,
+                    "time_diff_seconds": diff,
+                    "locked_at": row["locked_at"],
+                }
+            )
+        return {
+            "drill_id": drill_id,
+            "version": drill["version"],
+            "sealed": bool(drill["sealed"]),
+            "locks": items,
+        }
     finally:
         conn.close()
 
